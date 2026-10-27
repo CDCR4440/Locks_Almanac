@@ -300,15 +300,82 @@ def parse_archive(payload: bytes) -> Feed:
     return Feed(title=DEFAULT_TITLE, posts=select_posts(posts))
 
 
-def load_posts() -> tuple[Feed, str]:
+def _extract_payload(document: str) -> bytes | None:
+    """Pull RSS or JSON out of a browser document, including Chrome's XML view."""
+    match = re.search(r"(<\?xml[\s\S]*</rss>)", document, re.I)
+    if match is None:
+        match = re.search(r"(<rss[\s\S]*</rss>)", document, re.I)
+    if match is not None:
+        return match.group(1).encode()
+    stripped = re.sub(r"<[^>]+>", " ", document)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    start_candidates = [index for index in (stripped.find("["), stripped.find("{")) if index >= 0]
+    if not start_candidates:
+        return None
+    candidate = stripped[min(start_candidates) :].encode()
+    if _acceptable(candidate):
+        return candidate
+    return None
+
+
+def fetch_with_playwright(url: str) -> bytes:
+    """Open the Substack URL in Chromium and keep the response after any challenge."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("playwright is not installed") from exc
+
+    found: dict[str, bytes] = {}
+
+    def remember(body: bytes) -> None:
+        if body and _acceptable(body) and "body" not in found:
+            found["body"] = body
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            page = browser.new_page(user_agent=BROWSER_UA, locale="en-US")
+
+            def on_response(response) -> None:
+                try:
+                    remember(response.body())
+                except Exception:
+                    return
+
+            page.on("response", on_response)
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            for _ in range(12):
+                if "body" in found:
+                    return found["body"]
+                extracted = _extract_payload(page.content())
+                if extracted is not None:
+                    return extracted
+                page.wait_for_timeout(2000)
+            raise RuntimeError(f"browser did not return posts: {_snippet(page.content().encode())}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"browser request failed: {exc}") from exc
+        finally:
+            browser.close()
+
+
+def load_posts(use_browser: bool = False) -> tuple[Feed, str]:
     """Prefer the RSS feed. Fall back to Substack's own archive if it is challenged."""
     sources = (
         ("rss", FEED_URL, parse_feed),
         ("archive", ARCHIVE_URL, parse_archive),
     )
-    cheap = (fetch_with_urllib, fetch_with_curl)
+    rounds: list[tuple] = []
+    if use_browser:
+        rounds.append((fetch_with_playwright,))
+    rounds.append((fetch_with_urllib, fetch_with_curl))
+    rounds.append((fetch_with_curl_cffi,))
     errors: list[str] = []
-    for fetchers in (cheap, (fetch_with_curl_cffi,)):
+    for fetchers in rounds:
         for label, url, parser in sources:
             try:
                 body = fetch_bytes(url, fetchers)
@@ -654,12 +721,21 @@ def run_self_test() -> None:
         raise AssertionError(f"archive slug fallback failed: {archived.posts[0].url}")
     if archived.posts[0].summary != "new":
         raise AssertionError(f"archive summary failed: {archived.posts[0].summary}")
+    wrapped = "<html><body><pre>&lt;rss&gt;nope</pre><rss version=\"2.0\"><channel><title>T</title></channel></rss></body></html>"
+    extracted = _extract_payload(wrapped)
+    if extracted is None or b"<rss" not in extracted:
+        raise AssertionError("could not extract RSS from a browser document")
     print("self-test ok")
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Build the Substack embed page.")
     parser.add_argument("--self-test", action="store_true", help="Run parser checks without the network.")
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="Also open the Substack URL in Chromium if the plain clients are challenged.",
+    )
     parser.add_argument("--site-dir", type=Path, default=SITE_DIR, help="Directory to write the static site into.")
     args = parser.parse_args(argv)
 
@@ -667,7 +743,7 @@ def main(argv: list[str]) -> int:
         run_self_test()
         return 0
 
-    feed, source_url = load_posts()
+    feed, source_url = load_posts(use_browser=args.browser)
     build(feed, datetime.now(timezone.utc), args.site_dir, source_url)
     print(f"Wrote {args.site_dir / 'index.html'}")
     print(f"Wrote {args.site_dir / 'embed.html'}")

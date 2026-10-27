@@ -1,6 +1,6 @@
 # Rebuild the embed from the Substack RSS feed and publish it with GitHub Pages.
-# The feed is downloaded on the runner by scripts/build_site.py (Python standard
-# library). Do not route this through rss2json or any other proxy.
+# The feed is downloaded on the runner directly from Substack.
+# Do not route this through rss2json or any other proxy.
 #
 # Pull requests only build the page, so the log shows the posts that were found.
 # Pushes to main, the 6-hour schedule, and Run workflow also deploy to Pages.
@@ -20,7 +20,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -37,9 +37,22 @@ jobs:
         run: python3 -m pip install --disable-pip-version-check "curl-cffi==0.17.0"
 
       - name: Build the embed from the Substack feed
+        id: quick
+        continue-on-error: true
         run: python3 scripts/build_site.py
 
+      # Cloudflare serves a JavaScript challenge to GitHub-hosted runners.
+      # Chromium still requests Substack directly; it is not an RSS proxy.
+      - name: Retry the direct request in Chromium
+        id: browser
+        if: steps.quick.outcome == 'failure'
+        run: |
+          python3 -m pip install --disable-pip-version-check playwright
+          python3 -m playwright install --with-deps chromium
+          python3 scripts/build_site.py --browser
+
       - name: Upload the built site
+        if: steps.quick.outcome == 'success' || steps.browser.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: substack-embed
