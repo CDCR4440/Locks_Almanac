@@ -1,0 +1,75 @@
+# Rebuild the embed from the Substack RSS feed and publish it with GitHub Pages.
+# The feed is downloaded on the runner by scripts/build_site.py (Python standard
+# library). Do not route this through rss2json or any other proxy.
+#
+# Pull requests only build the page, so the log shows the posts that were found.
+# Pushes to main, the 6-hour schedule, and Run workflow also deploy to Pages.
+
+name: Publish Substack embed
+
+on:
+  schedule:
+    # Every 6 hours. GitHub runs this in UTC and may start it a few minutes late.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check the page builder
+        run: python3 scripts/build_site.py --self-test
+
+      - name: Build the embed from the Substack feed
+        run: python3 scripts/build_site.py
+
+      - name: Upload the built site
+        uses: actions/upload-artifact@v4
+        with:
+          name: substack-embed
+          path: site
+          if-no-files-found: error
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    # One Pages deployment at a time. Do not cancel a deploy already in progress.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download the built site
+        uses: actions/download-artifact@v4
+        with:
+          name: substack-embed
+          path: site
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
