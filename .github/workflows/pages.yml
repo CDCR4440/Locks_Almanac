@@ -30,6 +30,12 @@ jobs:
       - name: Check the page builder
         run: python3 scripts/build_site.py --self-test
 
+      # curl-cffi speaks directly to Substack with a browser TLS fingerprint.
+      # GitHub-hosted runners otherwise get Cloudflare's challenge page. This is
+      # not an RSS proxy.
+      - name: Install curl-cffi for the direct Substack request
+        run: python3 -m pip install --disable-pip-version-check "curl-cffi==0.17.0"
+
       - name: Build the embed from the Substack feed
         run: python3 scripts/build_site.py
 

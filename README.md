@@ -58,7 +58,7 @@ If nobody commits to this repo for about 60 days, GitHub pauses the 6-hour sched
 
 ## For a developer
 
-- `scripts/build_site.py` downloads the feed and writes `site/index.html` and `site/embed.html`. It uses the Python standard library only.
+- `scripts/build_site.py` downloads posts and writes `site/index.html` and `site/embed.html`. It tries the RSS feed first. If Cloudflare challenges that URL, it reads Substack’s own archive JSON at the publication. Both are direct requests. The script does not use rss2json or any other proxy. Actions installs `curl-cffi` so the request can use a browser TLS fingerprint from GitHub’s servers.
 - `python3 scripts/build_site.py --self-test` checks parsing and HTML escaping without the network.
 - `python3 scripts/build_site.py` rebuilds the snapshot in `site/`.
 - `.github/workflows/pages.yml` rebuilds the page on the runner. Pull requests only build it. Pushes to `main`, the 6-hour schedule, and **Run workflow** also deploy the `site` folder with GitHub Pages (`actions/deploy-pages`). The live site is that deployed copy. It can be newer than the snapshot committed in git.

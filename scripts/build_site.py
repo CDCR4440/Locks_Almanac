@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Build a static embed page from the Colofornia Dreaming Substack RSS feed.
+"""Build a static embed page from the Colofornia Dreaming Substack.
 
-The feed is downloaded directly (no rss2json or other third-party proxy).
+Posts are downloaded directly from Substack (no rss2json or other
+third-party proxy). The RSS feed is preferred. If Cloudflare challenges
+that URL, the script reads Substack's own public archive JSON instead.
 Output is a self-contained HTML page meant to be iframed: no scripts, no
 frame-busting, styling in the page itself.
 """
@@ -10,11 +12,11 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 import shutil
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -24,12 +26,13 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 FEED_URL = "https://coloforniadreaming.substack.com/feed"
+ARCHIVE_URL = "https://coloforniadreaming.substack.com/api/v1/archive?sort=new&offset=0&limit=12"
 SUBSCRIBE_EMBED_URL = "https://coloforniadreaming.substack.com/embed"
 PUBLICATION_URL = "https://coloforniadreaming.substack.com"
 DEFAULT_TITLE = "Colofornia Dreaming"
 MAX_POSTS = 10
-# Substack sits behind Cloudflare, which rejects a bare Python client from
-# GitHub-hosted runners. A normal browser User-Agent is still a direct fetch.
+# Substack sits behind Cloudflare. A browser User-Agent is still a direct fetch.
+# GitHub-hosted runners often also need a browser TLS fingerprint (curl_cffi).
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -60,6 +63,40 @@ def _looks_like_feed(body: bytes) -> bool:
     return head.startswith(b"<?xml") or b"<rss" in head or b"<feed" in head
 
 
+def _looks_like_json(body: bytes) -> bool:
+    return body.lstrip()[:1] in (b"{", b"[")
+
+
+def _acceptable(body: bytes) -> bool:
+    return _looks_like_feed(body) or _looks_like_json(body)
+
+
+def _snippet(body: bytes) -> str:
+    return body[:160].decode("utf-8", "replace").replace("\n", " ")
+
+
+def fetch_with_urllib(url: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "application/rss+xml, application/xml, text/xml, application/json;q=0.9, */*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = _snippet(exc.read())
+        raise RuntimeError(f"python HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"python request failed: {exc}") from exc
+    if not _acceptable(body):
+        raise RuntimeError(f"python response was not a feed: {_snippet(body)}")
+    return body
+
+
 def fetch_with_curl(url: str) -> bytes:
     """Direct download with curl. Used when Python's HTTP client is rejected."""
     if shutil.which("curl") is None:
@@ -70,16 +107,12 @@ def fetch_with_curl(url: str) -> bytes:
             "-sS",
             "-L",
             "--compressed",
-            "--retry",
-            "2",
-            "--retry-delay",
-            "2",
             "--max-time",
             "40",
             "-A",
             BROWSER_UA,
             "-H",
-            "Accept: application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+            "Accept: application/rss+xml, application/xml, text/xml, application/json;q=0.9, */*;q=0.8",
             "-H",
             "Accept-Language: en-US,en;q=0.9",
             "-w",
@@ -90,54 +123,50 @@ def fetch_with_curl(url: str) -> bytes:
         capture_output=True,
     )
     if result.returncode != 0:
-        err = result.stderr.decode("utf-8", "replace")[:400]
+        err = result.stderr.decode("utf-8", "replace")[:200]
         raise RuntimeError(f"curl failed ({result.returncode}): {err}")
     raw = result.stdout
     if b"\n" not in raw:
         raise RuntimeError("curl returned no status code")
     body, _, status = raw.rpartition(b"\n")
     code = status.decode("ascii", "replace").strip()
-    if code != "200" or not _looks_like_feed(body):
-        snippet = body[:240].decode("utf-8", "replace").replace("\n", " ")
-        raise RuntimeError(f"curl HTTP {code}: {snippet}")
+    if code != "200" or not _acceptable(body):
+        raise RuntimeError(f"curl HTTP {code}: {_snippet(body)}")
     return body
 
 
-def fetch_feed(url: str, attempts: int = 3) -> bytes:
-    """Download the RSS document directly. Raises RuntimeError after the last attempt."""
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        request = urllib.request.Request(
+def fetch_with_curl_cffi(url: str) -> bytes:
+    """Direct download with a browser TLS fingerprint. Optional dependency."""
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError("curl_cffi is not installed") from exc
+    try:
+        response = curl_requests.get(
             url,
+            impersonate="chrome",
+            timeout=40,
             headers={
-                "User-Agent": BROWSER_UA,
-                "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+                "Accept": "application/rss+xml, application/xml, text/xml, application/json;q=0.9, */*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             },
         )
+    except Exception as exc:
+        raise RuntimeError(f"curl_cffi request failed: {exc}") from exc
+    body = response.content or b""
+    if response.status_code != 200 or not _acceptable(body):
+        raise RuntimeError(f"curl_cffi HTTP {response.status_code}: {_snippet(body)}")
+    return body
+
+
+def fetch_bytes(url: str, fetchers: tuple) -> bytes:
+    errors: list[str] = []
+    for fetcher in fetchers:
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                body = response.read()
-        except urllib.error.HTTPError as exc:
-            detail = exc.read()[:240].decode("utf-8", "replace").replace("\n", " ")
-            last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
-            if attempt < attempts:
-                time.sleep(2 * attempt)
-            continue
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            last_error = exc
-            if attempt < attempts:
-                time.sleep(2 * attempt)
-            continue
-        if _looks_like_feed(body):
-            return body
-        last_error = RuntimeError("response was not RSS")
-        if attempt < attempts:
-            time.sleep(2 * attempt)
-    try:
-        return fetch_with_curl(url)
-    except RuntimeError as exc:
-        raise RuntimeError(f"Could not download the Substack feed: {last_error}; {exc}") from exc
+            return fetcher(url)
+        except RuntimeError as exc:
+            errors.append(str(exc)[:180])
+    raise RuntimeError("; ".join(errors))
 
 
 def _local(tag: str) -> str:
@@ -226,6 +255,75 @@ def select_posts(posts: list[Post], limit: int = MAX_POSTS) -> list[Post]:
     return sorted(posts, key=sort_key)[:limit]
 
 
+def parse_iso(raw: str) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_archive(payload: bytes) -> Feed:
+    """Substack's public archive. Same posts as the RSS feed, as JSON."""
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Substack archive was not valid JSON: {exc}") from exc
+    if not isinstance(data, list):
+        raise RuntimeError("Substack archive was not a list of posts")
+
+    posts: list[Post] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        item_title = _plain_text(str(item.get("title") or ""))
+        url = _safe_http_url(str(item.get("canonical_url") or ""))
+        if url is None:
+            slug = str(item.get("slug") or "").strip()
+            if slug and all(part not in slug for part in ("/", " ", "..")):
+                url = f"{PUBLICATION_URL}/p/{slug}"
+        if not item_title or url is None:
+            continue
+        summary = _truncate(_plain_text(str(item.get("subtitle") or item.get("description") or "")))
+        posts.append(
+            Post(
+                title=item_title,
+                url=url,
+                published=parse_iso(str(item.get("post_date") or "")),
+                summary=summary,
+            )
+        )
+    return Feed(title=DEFAULT_TITLE, posts=select_posts(posts))
+
+
+def load_posts() -> tuple[Feed, str]:
+    """Prefer the RSS feed. Fall back to Substack's own archive if it is challenged."""
+    sources = (
+        ("rss", FEED_URL, parse_feed),
+        ("archive", ARCHIVE_URL, parse_archive),
+    )
+    cheap = (fetch_with_urllib, fetch_with_curl)
+    errors: list[str] = []
+    for fetchers in (cheap, (fetch_with_curl_cffi,)):
+        for label, url, parser in sources:
+            try:
+                body = fetch_bytes(url, fetchers)
+                feed = parser(body)
+            except RuntimeError as exc:
+                errors.append(f"{label}: {exc}")
+                continue
+            if not feed.posts:
+                errors.append(f"{label}: no posts")
+                continue
+            print(f"Source: {label} ({url})")
+            return feed, url
+    raise RuntimeError("Could not read posts from Substack. " + " | ".join(errors))
+
+
 def format_date(when: datetime) -> str:
     return f"{when.strftime('%B')} {when.day}, {when.year}"
 
@@ -263,7 +361,7 @@ def render_posts(posts: list[Post]) -> str:
     return '<ol class="posts">\n' + "\n".join(items) + "\n</ol>"
 
 
-def render_page(feed: Feed, generated_at: datetime) -> str:
+def render_page(feed: Feed, generated_at: datetime, source_url: str = FEED_URL) -> str:
     generated = generated_at.astimezone(timezone.utc)
     stamp = f"{format_date(generated)} at {generated.strftime('%H:%M')} UTC"
     posts_html = render_posts(feed.posts)
@@ -276,7 +374,7 @@ def render_page(feed: Feed, generated_at: datetime) -> str:
   <title>{html.escape(title)} — Latest posts</title>
   <meta name="description" content="Latest posts from {html.escape(title)}, plus the Substack subscribe form.">
   <meta name="referrer" content="strict-origin-when-cross-origin">
-  <!-- Generated from {html.escape(FEED_URL)}. {html.escape(stamp)}. Do not edit by hand. -->
+  <!-- Generated from {html.escape(source_url)}. {html.escape(stamp)}. Do not edit by hand. -->
   <style>
     :root {{
       --paper: #f3eee4;
@@ -471,12 +569,10 @@ def write_site(page: str, site_dir: Path) -> None:
     (site_dir / "embed.html").write_text(page, encoding="utf-8")
 
 
-def build(feed_xml: bytes, generated_at: datetime, site_dir: Path) -> Feed:
-    feed = parse_feed(feed_xml)
-    page = render_page(feed, generated_at)
+def build(feed: Feed, generated_at: datetime, site_dir: Path, source_url: str) -> None:
+    page = render_page(feed, generated_at, source_url)
     assert_embeddable(page, feed)
     write_site(page, site_dir)
-    return feed
 
 
 def run_self_test() -> None:
@@ -533,6 +629,31 @@ def run_self_test() -> None:
         raise AssertionError("javascript URL leaked into the page")
     if 'class="post"' not in page or page.count('class="post"') != MAX_POSTS:
         raise AssertionError("post markup count mismatch")
+
+    archive = json.dumps(
+        [
+            {
+                "title": "Older <b>one</b>",
+                "canonical_url": "https://coloforniadreaming.substack.com/p/older",
+                "post_date": "2024-01-01T00:00:00.000Z",
+                "subtitle": "old",
+            },
+            {
+                "title": "Newer & fresh",
+                "canonical_url": "javascript:alert(1)",
+                "slug": "newer",
+                "post_date": "2026-10-28T15:04:00.000Z",
+                "subtitle": "<i>new</i>",
+            },
+        ]
+    ).encode()
+    archived = parse_archive(archive)
+    if [post.title for post in archived.posts] != ["Newer & fresh", "Older one"]:
+        raise AssertionError(f"archive order or escaping failed: {archived.posts}")
+    if archived.posts[0].url != "https://coloforniadreaming.substack.com/p/newer":
+        raise AssertionError(f"archive slug fallback failed: {archived.posts[0].url}")
+    if archived.posts[0].summary != "new":
+        raise AssertionError(f"archive summary failed: {archived.posts[0].summary}")
     print("self-test ok")
 
 
@@ -546,8 +667,8 @@ def main(argv: list[str]) -> int:
         run_self_test()
         return 0
 
-    xml_bytes = fetch_feed(FEED_URL)
-    feed = build(xml_bytes, datetime.now(timezone.utc), args.site_dir)
+    feed, source_url = load_posts()
+    build(feed, datetime.now(timezone.utc), args.site_dir, source_url)
     print(f"Wrote {args.site_dir / 'index.html'}")
     print(f"Wrote {args.site_dir / 'embed.html'}")
     print(f"Posts ({len(feed.posts)}):")
