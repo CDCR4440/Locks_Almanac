@@ -18,8 +18,10 @@ on:
   pull_request:
 
 jobs:
+  # Linux GitHub-hosted runners are challenged by Cloudflare on substack.com
+  # ("Just a moment..."). macOS runners are not in that same address block.
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 15
     permissions:
       contents: read
