@@ -59,16 +59,41 @@ class Feed:
 
 
 def _looks_like_feed(body: bytes) -> bool:
-    head = body.lstrip()[:400].lower()
-    return head.startswith(b"<?xml") or b"<rss" in head or b"<feed" in head
+    head = body.lstrip(b"\xef\xbb\xbf \t\r\n")[:200].lower()
+    if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+        return False
+    return head.startswith(b"<?xml") or head.startswith(b"<rss") or head.startswith(b"<feed")
 
 
 def _looks_like_json(body: bytes) -> bool:
-    return body.lstrip()[:1] in (b"{", b"[")
+    head = body.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head.startswith(b"["):
+        return True
+    if not head.startswith(b"{"):
+        return False
+    return head[1:].lstrip().startswith(b'"')
 
 
 def _acceptable(body: bytes) -> bool:
     return _looks_like_feed(body) or _looks_like_json(body)
+
+
+def _usable(body: bytes) -> bool:
+    """True only when the bytes actually parse as RSS or JSON."""
+    cleaned = body.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if _looks_like_feed(cleaned):
+        try:
+            ET.fromstring(cleaned)
+        except ET.ParseError:
+            return False
+        return True
+    if _looks_like_json(cleaned):
+        try:
+            json.loads(cleaned)
+        except json.JSONDecodeError:
+            return False
+        return True
+    return False
 
 
 def _snippet(body: bytes) -> str:
@@ -326,10 +351,16 @@ def fetch_with_playwright(url: str) -> bytes:
         raise RuntimeError("playwright is not installed") from exc
 
     found: dict[str, bytes] = {}
+    rejected: list[str] = []
 
     def remember(body: bytes) -> None:
-        if body and _acceptable(body) and "body" not in found:
-            found["body"] = body
+        if not body or "body" in found:
+            return
+        if _usable(body):
+            found["body"] = body.lstrip(b"\xef\xbb\xbf")
+            return
+        if len(rejected) < 2:
+            rejected.append(repr(body[:80]))
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
@@ -351,10 +382,14 @@ def fetch_with_playwright(url: str) -> bytes:
                 if "body" in found:
                     return found["body"]
                 extracted = _extract_payload(page.content())
-                if extracted is not None:
+                if extracted is not None and _usable(extracted):
                     return extracted
+                print(f"browser waiting: title={page.title()!r} rejected={rejected}", flush=True)
                 page.wait_for_timeout(2000)
-            raise RuntimeError(f"browser did not return posts: {_snippet(page.content().encode())}")
+            raise RuntimeError(
+                f"browser did not return posts: title={page.title()!r} rejected={rejected} "
+                f"page={_snippet(page.content().encode())}"
+            )
         except RuntimeError:
             raise
         except Exception as exc:
@@ -369,11 +404,11 @@ def load_posts(use_browser: bool = False) -> tuple[Feed, str]:
         ("rss", FEED_URL, parse_feed),
         ("archive", ARCHIVE_URL, parse_archive),
     )
-    rounds: list[tuple] = []
     if use_browser:
-        rounds.append((fetch_with_playwright,))
-    rounds.append((fetch_with_urllib, fetch_with_curl))
-    rounds.append((fetch_with_curl_cffi,))
+        # The plain clients already failed in this job. Don't repeat them.
+        rounds: list[tuple] = [(fetch_with_playwright,)]
+    else:
+        rounds = [(fetch_with_urllib, fetch_with_curl), (fetch_with_curl_cffi,)]
     errors: list[str] = []
     for fetchers in rounds:
         for label, url, parser in sources:
