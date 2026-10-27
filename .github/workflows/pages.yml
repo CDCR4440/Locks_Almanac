@@ -32,29 +32,39 @@ jobs:
       - name: Check the page builder
         run: python3 scripts/build_site.py --self-test
 
-      # curl-cffi speaks directly to Substack with a browser TLS fingerprint.
-      # GitHub-hosted runners otherwise get Cloudflare's challenge page. This is
-      # not an RSS proxy.
-      - name: Install curl-cffi for the direct Substack request
-        run: python3 -m pip install --disable-pip-version-check "curl-cffi==0.17.0"
-
+      # Python and curl first. No extra packages, so a runner that can reach
+      # Substack publishes immediately.
       - name: Build the embed from the Substack feed
         id: quick
         continue-on-error: true
         run: python3 scripts/build_site.py
 
-      # Cloudflare serves a JavaScript challenge to GitHub-hosted runners.
-      # Chromium still requests Substack directly; it is not an RSS proxy.
+      # Same Substack URL, with a browser TLS fingerprint. Not an RSS proxy.
+      - name: Retry with a browser TLS fingerprint
+        id: cffi
+        if: steps.quick.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          python3 -m pip install --disable-pip-version-check --break-system-packages "curl-cffi==0.17.0"
+          python3 scripts/build_site.py
+
+      # Cloudflare sometimes serves a JavaScript challenge. Chromium still
+      # requests Substack directly.
       - name: Retry the direct request in Chromium
         id: browser
-        if: steps.quick.outcome == 'failure'
+        if: steps.quick.outcome == 'failure' && steps.cffi.outcome == 'failure'
+        continue-on-error: true
         run: |
-          python3 -m pip install --disable-pip-version-check playwright
-          python3 -m playwright install --with-deps chromium
+          python3 -m pip install --disable-pip-version-check --break-system-packages playwright
+          python3 -m playwright install chromium
           python3 scripts/build_site.py --browser
 
+      - name: Fail if Substack could not be read
+        if: steps.quick.outcome == 'failure' && steps.cffi.outcome == 'failure' && steps.browser.outcome == 'failure'
+        run: exit 1
+
       - name: Upload the built site
-        if: steps.quick.outcome == 'success' || steps.browser.outcome == 'success'
+        if: steps.quick.outcome == 'success' || steps.cffi.outcome == 'success' || steps.browser.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: substack-embed
