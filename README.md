@@ -44,21 +44,26 @@ The list shows the latest 10 posts when the feed has that many. The feed has few
 
 ## What updates by itself
 
-A job named **Publish Substack embed** runs every 6 hours (UTC). It downloads `https://coloforniadreaming.substack.com/feed` directly and republishes the page. It also runs when `main` changes, and when you use **Run workflow**.
+A job named **Publish Substack embed** runs every 6 hours (UTC). It also runs when `main` changes, and when you use **Run workflow**.
 
-The job does not use rss2json or any other third-party RSS proxy.
+The job downloads `https://coloforniadreaming.substack.com/feed` directly from Substack. It does not use rss2json or any other third-party RSS proxy.
+
+Substack’s host often shows GitHub’s servers a “checking your browser” page, so the download from GitHub does not always succeed. When that happens, the job still publishes the saved copy of the page in this repository and leaves a yellow warning on the Actions run. That saved copy already lists the posts that were on the feed when it was last built here. On any run that can download the feed, the live page is rebuilt from the new posts.
+
+If a new Substack post is missing from the website, the automatic download was blocked. Someone with this repo can rebuild the page from a normal computer, where the feed opens, with `python3 scripts/build_site.py`, then commit the updated `site` folder. The next publish puts that copy on the website.
 
 If nobody commits to this repo for about 60 days, GitHub pauses the 6-hour schedule. The last published page stays up. Open **Actions**, run **Publish Substack embed** once, and the schedule starts again.
 
 ## If the page is blank or a post is missing
 
 1. Open the **Actions** tab and look at the newest **Publish Substack embed** run.
-2. A red X means the Substack feed could not be downloaded. The previous page stays up. Click **Run workflow** to try again.
-3. After a green check, wait about 10 minutes, then refresh the website.
+2. A red X on the **deploy** job usually means GitHub Pages is not set to **GitHub Actions** yet. Do the one-time steps above, then click **Run workflow**.
+3. A yellow warning means the feed could not be downloaded from GitHub’s network. The saved copy stays up. See the section above to rebuild it from a normal computer.
+4. After a green check, wait about 10 minutes, then refresh the website.
 
 ## For a developer
 
-- `scripts/build_site.py` downloads posts and writes `site/index.html` and `site/embed.html`. It tries the RSS feed first. If Cloudflare challenges that URL, it reads Substack’s own archive JSON at the publication. Both are direct requests. The script does not use rss2json or any other proxy. Actions installs `curl-cffi` so the request can use a browser TLS fingerprint from GitHub’s servers. If Cloudflare still returns its challenge page, the job retries the same Substack URL in Chromium.
+- `scripts/build_site.py` downloads posts and writes `site/index.html` and `site/embed.html`. It tries the RSS feed first. If that URL is challenged, it reads Substack’s own archive JSON at the publication. Both are direct requests. The script does not use rss2json or any other proxy. Actions installs `curl-cffi` so the request can use a browser TLS fingerprint. If the runner still gets Cloudflare’s challenge page, the workflow publishes the `site/` snapshot instead of failing.
 - `python3 scripts/build_site.py --self-test` checks parsing and HTML escaping without the network.
 - `python3 scripts/build_site.py` rebuilds the snapshot in `site/`.
 - `.github/workflows/pages.yml` rebuilds the page on the runner. Pull requests only build it. Pushes to `main`, the 6-hour schedule, and **Run workflow** also deploy the `site` folder with GitHub Pages (`actions/deploy-pages`). The live site is that deployed copy. It can be newer than the snapshot committed in git.

@@ -18,11 +18,9 @@ on:
   pull_request:
 
 jobs:
-  # Linux GitHub-hosted runners are challenged by Cloudflare on substack.com
-  # ("Just a moment..."). macOS runners are not in that same address block.
   build:
-    runs-on: macos-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -32,39 +30,25 @@ jobs:
       - name: Check the page builder
         run: python3 scripts/build_site.py --self-test
 
-      # Python and curl first. No extra packages, so a runner that can reach
-      # Substack publishes immediately.
+      # Direct request only. curl-cffi is a browser TLS fingerprint for that
+      # same Substack URL, not an RSS proxy. GitHub-hosted runners are often
+      # shown Cloudflare's "Just a moment..." page; the saved site/ is published
+      # when that happens.
       - name: Build the embed from the Substack feed
-        id: quick
-        continue-on-error: true
-        run: python3 scripts/build_site.py
-
-      # Same Substack URL, with a browser TLS fingerprint. Not an RSS proxy.
-      - name: Retry with a browser TLS fingerprint
-        id: cffi
-        if: steps.quick.outcome == 'failure'
+        id: refresh
         continue-on-error: true
         run: |
-          python3 -m pip install --disable-pip-version-check --break-system-packages "curl-cffi==0.17.0"
+          python3 -m pip install --disable-pip-version-check "curl-cffi==0.17.0"
           python3 scripts/build_site.py
 
-      # Cloudflare sometimes serves a JavaScript challenge. Chromium still
-      # requests Substack directly.
-      - name: Retry the direct request in Chromium
-        id: browser
-        if: steps.quick.outcome == 'failure' && steps.cffi.outcome == 'failure'
-        continue-on-error: true
+      - name: Use the saved page when Substack challenges this runner
+        if: steps.refresh.outcome == 'failure'
         run: |
-          python3 -m pip install --disable-pip-version-check --break-system-packages playwright
-          python3 -m playwright install chromium
-          python3 scripts/build_site.py --browser
-
-      - name: Fail if Substack could not be read
-        if: steps.quick.outcome == 'failure' && steps.cffi.outcome == 'failure' && steps.browser.outcome == 'failure'
-        run: exit 1
+          echo "::warning::Substack returned Cloudflare's browser check to this runner. Publishing the saved copy in site/. The page refreshes itself on any run that can download the feed."
+          test -f site/index.html
+          test -f site/embed.html
 
       - name: Upload the built site
-        if: steps.quick.outcome == 'success' || steps.cffi.outcome == 'success' || steps.browser.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: substack-embed
