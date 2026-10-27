@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import html
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -26,7 +28,13 @@ SUBSCRIBE_EMBED_URL = "https://coloforniadreaming.substack.com/embed"
 PUBLICATION_URL = "https://coloforniadreaming.substack.com"
 DEFAULT_TITLE = "Colofornia Dreaming"
 MAX_POSTS = 10
-USER_AGENT = "LocksAlmanac/1.0 (+https://github.com/CDCR4440/Locks_Almanac)"
+# Substack sits behind Cloudflare, which rejects a bare Python client from
+# GitHub-hosted runners. A normal browser User-Agent is still a direct fetch.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 ROOT = Path(__file__).resolve().parents[1]
 SITE_DIR = ROOT / "site"
 TAG_RE = re.compile(r"<[^>]+>")
@@ -47,32 +55,89 @@ class Feed:
     posts: list[Post]
 
 
+def _looks_like_feed(body: bytes) -> bool:
+    head = body.lstrip()[:400].lower()
+    return head.startswith(b"<?xml") or b"<rss" in head or b"<feed" in head
+
+
+def fetch_with_curl(url: str) -> bytes:
+    """Direct download with curl. Used when Python's HTTP client is rejected."""
+    if shutil.which("curl") is None:
+        raise RuntimeError("curl is not installed")
+    result = subprocess.run(
+        [
+            "curl",
+            "-sS",
+            "-L",
+            "--compressed",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "2",
+            "--max-time",
+            "40",
+            "-A",
+            BROWSER_UA,
+            "-H",
+            "Accept: application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+            "-H",
+            "Accept-Language: en-US,en;q=0.9",
+            "-w",
+            "\n%{http_code}",
+            url,
+        ],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"curl failed ({result.returncode}): {err}")
+    raw = result.stdout
+    if b"\n" not in raw:
+        raise RuntimeError("curl returned no status code")
+    body, _, status = raw.rpartition(b"\n")
+    code = status.decode("ascii", "replace").strip()
+    if code != "200" or not _looks_like_feed(body):
+        snippet = body[:240].decode("utf-8", "replace").replace("\n", " ")
+        raise RuntimeError(f"curl HTTP {code}: {snippet}")
+    return body
+
+
 def fetch_feed(url: str, attempts: int = 3) -> bytes:
-    """Download the RSS document. Raises RuntimeError after the last attempt."""
+    """Download the RSS document directly. Raises RuntimeError after the last attempt."""
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": USER_AGENT,
+                "User-Agent": BROWSER_UA,
                 "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
             },
         )
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 body = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:240].decode("utf-8", "replace").replace("\n", " ")
+            last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
+            if attempt < attempts:
+                time.sleep(2 * attempt)
+            continue
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
             if attempt < attempts:
                 time.sleep(2 * attempt)
             continue
-        if not body or not body.strip():
-            last_error = RuntimeError("Feed response was empty")
-            if attempt < attempts:
-                time.sleep(2 * attempt)
-            continue
-        return body
-    raise RuntimeError(f"Could not download the Substack feed: {last_error}")
+        if _looks_like_feed(body):
+            return body
+        last_error = RuntimeError("response was not RSS")
+        if attempt < attempts:
+            time.sleep(2 * attempt)
+    try:
+        return fetch_with_curl(url)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Could not download the Substack feed: {last_error}; {exc}") from exc
 
 
 def _local(tag: str) -> str:
