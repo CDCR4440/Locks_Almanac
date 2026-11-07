@@ -380,12 +380,29 @@ def _extract_payload(document: str) -> bytes | None:
     return None
 
 
-def _playwright_installed() -> bool:
+def _browser_driver():
+    """Prefer Patchright. It drives Chrome without Playwright's automation signals.
+
+    Cloudflare on Substack leaves the stock Playwright build on the
+    "Just a moment..." page when the request comes from GitHub's servers.
+    """
     try:
-        import playwright  # noqa: F401
+        from patchright.sync_api import sync_playwright
+
+        return sync_playwright, "patchright"
     except ImportError:
-        return False
-    return True
+        pass
+    try:
+        from playwright.sync_api import sync_playwright
+
+        return sync_playwright, "playwright"
+    except ImportError:
+        return None, ""
+
+
+def _playwright_installed() -> bool:
+    driver, _name = _browser_driver()
+    return driver is not None
 
 
 def _installed_chrome_version() -> str:
@@ -496,14 +513,13 @@ def _nudge_cloudflare(page) -> None:
 
 def fetch_with_playwright(url: str) -> bytes:
     """Open the Substack URL in Chrome and keep the response after any challenge."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError("playwright is not installed") from exc
+    sync_playwright, driver_name = _browser_driver()
+    if sync_playwright is None:
+        raise RuntimeError("patchright is not installed")
 
     headed = bool(os.environ.get("DISPLAY"))
     print(
-        f"Opening {url} in {'headed' if headed else 'headless'} Chrome. "
+        f"Opening {url} in {'headed' if headed else 'headless'} Chrome via {driver_name}. "
         "Direct download did not return posts.",
         flush=True,
     )
@@ -526,10 +542,12 @@ def fetch_with_playwright(url: str) -> bytes:
             if not headed:
                 context_kwargs["user_agent"] = _desktop_user_agent(chrome_version)
             context = browser.new_context(**context_kwargs)
-            # Cloudflare treats navigator.webdriver as a bot signal.
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+            # Patchright already hides the automation flag. An extra override
+            # is itself a signal, so only the stock Playwright driver needs it.
+            if driver_name != "patchright":
+                context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
             page = context.new_page()
             if not headed:
                 _hide_headless_client_hints(page, chrome_version)
@@ -592,6 +610,10 @@ def load_posts(use_browser: bool = False) -> tuple[Feed, str]:
                 feed = parser(body)
             except RuntimeError as exc:
                 errors.append(f"{label}: {exc}")
+                # The publication host and substack.com sit behind the same
+                # challenge. When Chrome cannot clear it, the other URLs will not either.
+                if fetchers == (fetch_with_playwright,) and "Just a moment" in str(exc):
+                    break
                 continue
             if not feed.posts:
                 errors.append(f"{label}: no posts")

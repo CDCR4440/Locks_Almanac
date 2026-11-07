@@ -38,13 +38,14 @@ jobs:
       # Direct request only. The publication host usually answers GitHub with
       # Cloudflare's challenge page, so the script also reads the public
       # profile posts API on substack.com. curl-cffi is a browser TLS
-      # fingerprint for that same request, not an RSS proxy. Playwright drives
+      # fingerprint for that same request, not an RSS proxy. Patchright drives
       # the Chrome already installed on the runner when every direct download
-      # is challenged. The script leaves site/ in place and exits 0 if
-      # Substack cannot be reached at all.
+      # is challenged. Stock Playwright is detected and left on the challenge
+      # page. The script leaves site/ in place and exits 0 if Substack cannot
+      # be reached at all.
       - name: Build the embed from the Substack feed
         run: |
-          python3 -m pip install --disable-pip-version-check "curl-cffi==0.17.0" "playwright==1.64.1"
+          python3 -m pip install --disable-pip-version-check "curl-cffi==0.17.0" "patchright==1.64.4"
           if ! command -v xvfb-run >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y xvfb
