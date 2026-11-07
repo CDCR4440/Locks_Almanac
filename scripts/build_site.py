@@ -3,10 +3,11 @@
 
 Posts are downloaded directly from Substack (no rss2json or other
 third-party proxy). The RSS feed is preferred. If Cloudflare challenges
-that URL, the script reads Substack's own public archive JSON, then opens
-the same URL in Chrome when Playwright is installed. If Substack cannot be
-reached at all and a previous page is already in site/, the build keeps
-that page and exits successfully.
+that host, the script reads Substack's archive JSON, then the same posts
+from the public profile API on substack.com, then opens the URL in Chrome
+when Playwright is installed. If Substack cannot be reached at all and a
+previous page is already in site/, the build keeps that page and exits
+successfully.
 Output is a self-contained HTML page meant to be iframed: no scripts, no
 frame-busting, styling in the page itself.
 """
@@ -33,6 +34,12 @@ FEED_URL = "https://coloforniadreaming.substack.com/feed"
 # Substack rejects ?offset=0 with HTTP 400, and the body is {"posts": [...]}
 # rather than a bare list. Limit is enough for the latest page of posts.
 ARCHIVE_URL = "https://coloforniadreaming.substack.com/api/v1/archive?sort=new&limit=12"
+# GitHub's servers are shown a Cloudflare challenge on the publication host.
+# The same posts are public on substack.com itself. 562145392 is the
+# Colofornia Dreaming profile id from https://substack.com/@coloforniadreaming.
+PROFILE_POSTS_URL = (
+    "https://substack.com/api/v1/profile/posts?profile_user_id=562145392&limit=12"
+)
 SUBSCRIBE_EMBED_URL = "https://coloforniadreaming.substack.com/embed"
 PUBLICATION_URL = "https://coloforniadreaming.substack.com"
 DEFAULT_TITLE = "Colofornia Dreaming"
@@ -472,6 +479,21 @@ def _hide_headless_client_hints(page, version: str) -> None:
         print(f"browser client-hint override skipped: {exc}", flush=True)
 
 
+def _nudge_cloudflare(page) -> None:
+    """Click the Cloudflare checkbox when the challenge page shows one."""
+    try:
+        page.mouse.move(420, 320)
+        widget = page.locator("iframe[src*='challenges.cloudflare.com']")
+        if widget.count() == 0:
+            return
+        box = widget.first.bounding_box()
+        if not box:
+            return
+        page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
+    except Exception:
+        return
+
+
 def fetch_with_playwright(url: str) -> bytes:
     """Open the Substack URL in Chrome and keep the response after any challenge."""
     try:
@@ -520,7 +542,7 @@ def fetch_with_playwright(url: str) -> bytes:
 
             page.on("response", on_response)
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            for _ in range(15):
+            for attempt in range(15):
                 if found:
                     return found[-1]
                 extracted = _extract_payload(page.content())
@@ -531,6 +553,8 @@ def fetch_with_playwright(url: str) -> bytes:
                     title = page.title()
                 except Exception:
                     title = ""
+                if "moment" in title.lower() and attempt % 3 == 1:
+                    _nudge_cloudflare(page)
                 print(f"browser waiting: title={title!r}", flush=True)
                 page.wait_for_timeout(2000)
             raise RuntimeError(
@@ -550,6 +574,7 @@ def load_posts(use_browser: bool = False) -> tuple[Feed, str]:
     sources = (
         ("rss", FEED_URL, parse_feed),
         ("archive", ARCHIVE_URL, parse_archive),
+        ("profile", PROFILE_POSTS_URL, parse_archive),
     )
     # Plain clients first. Chrome is only opened when those are challenged,
     # and only if Playwright is installed (or the caller asked for it).
