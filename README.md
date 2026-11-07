@@ -52,7 +52,9 @@ Substack’s publication host often shows GitHub’s servers a “checking your 
 
 If Substack is unreachable even in Chrome, the job stays green and publishes the saved copy of the page already in this repository. The Actions log shows a warning that the saved pages were left unchanged. That copy lists the posts from the last build that could reach Substack.
 
-If a new Substack post is still missing after a green run, open that run and read the warning. Someone with this repo can rebuild the page from a normal computer, where the feed opens, with `python3 scripts/build_site.py`, then commit the updated `site` folder. The next publish puts that copy on the website.
+If a new Substack post is still missing after a green run, open that run and read the warning. GitHub’s own servers are on a network Cloudflare does not let through, and the browser check does not clear there. Someone with this repo can rebuild the page from a normal computer, where the feed opens, with `python3 scripts/build_site.py`, then commit the updated `site` folder. The next publish puts that copy on the website.
+
+To have the 6-hour job download the posts by itself, add a self-hosted runner (Settings, Actions, Runners) on a computer where https://coloforniadreaming.substack.com/feed opens, and in `.github/workflows/pages.yml` change `runs-on: ubuntu-latest` under the build job to that runner’s label. No secret and no change to the Pages source are required. Pages is already set to GitHub Actions.
 
 If nobody commits to this repo for about 60 days, GitHub pauses the 6-hour schedule. The last published page stays up. Open **Actions**, run **Publish Substack embed** once, and the schedule starts again.
 

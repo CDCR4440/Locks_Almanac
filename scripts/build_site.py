@@ -560,7 +560,8 @@ def fetch_with_playwright(url: str) -> bytes:
 
             page.on("response", on_response)
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            for attempt in range(15):
+            # A challenge that is going to clear does so in a few seconds.
+            for attempt in range(8):
                 if found:
                     return found[-1]
                 extracted = _extract_payload(page.content())
@@ -899,6 +900,21 @@ def explain_fallback(site_dir: Path) -> str | None:
     )
 
 
+def _short_reason(exc: BaseException) -> str:
+    """One sentence for the log. Leave Cloudflare's HTML out of it."""
+    text = " ".join(str(exc).split())
+    if "Just a moment" in text:
+        return (
+            'Cloudflare answered with a browser check ("Just a moment...") '
+            "and it did not clear."
+        )
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 240:
+        text = text[:240].rstrip() + "…"
+    return text
+
+
 def _github_warning(message: str) -> None:
     one_line = " ".join(message.split())
     print(f"warning: {one_line}", flush=True)
@@ -1014,6 +1030,9 @@ def run_self_test() -> None:
         notice = explain_fallback(saved)
         if notice is None or "Substack could not be reached" not in notice or "\n" in notice:
             raise AssertionError(f"saved pages should produce a one-line notice: {notice!r}")
+    reason = _short_reason(RuntimeError("HTTP 403 <title>Just a moment...</title> more html"))
+    if "did not clear" not in reason or "<" in reason:
+        raise AssertionError(f"challenge reason was not plain: {reason!r}")
     print("self-test ok")
 
 
@@ -1039,10 +1058,7 @@ def main(argv: list[str]) -> int:
         notice = explain_fallback(args.site_dir)
         if notice is None:
             raise
-        detail = " ".join(str(exc).split())
-        if len(detail) > 400:
-            detail = detail[:400].rstrip() + "…"
-        _github_warning(f"{notice} {detail}")
+        _github_warning(f"{notice} {_short_reason(exc)}")
         return 0
     build(feed, datetime.now(timezone.utc), args.site_dir, source_url)
     print(f"Wrote {args.site_dir / 'index.html'}")
