@@ -3,7 +3,10 @@
 
 Posts are downloaded directly from Substack (no rss2json or other
 third-party proxy). The RSS feed is preferred. If Cloudflare challenges
-that URL, the script reads Substack's own public archive JSON instead.
+that URL, the script reads Substack's own public archive JSON, then opens
+the same URL in Chrome when Playwright is installed. If Substack cannot be
+reached at all and a previous page is already in site/, the build keeps
+that page and exits successfully.
 Output is a self-contained HTML page meant to be iframed: no scripts, no
 frame-busting, styling in the page itself.
 """
@@ -13,6 +16,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,7 +30,9 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 FEED_URL = "https://coloforniadreaming.substack.com/feed"
-ARCHIVE_URL = "https://coloforniadreaming.substack.com/api/v1/archive?sort=new&offset=0&limit=12"
+# Substack rejects ?offset=0 with HTTP 400, and the body is {"posts": [...]}
+# rather than a bare list. Limit is enough for the latest page of posts.
+ARCHIVE_URL = "https://coloforniadreaming.substack.com/api/v1/archive?sort=new&limit=12"
 SUBSCRIBE_EMBED_URL = "https://coloforniadreaming.substack.com/embed"
 PUBLICATION_URL = "https://coloforniadreaming.substack.com"
 DEFAULT_TITLE = "Colofornia Dreaming"
@@ -100,6 +106,31 @@ def _snippet(body: bytes) -> str:
     return body[:160].decode("utf-8", "replace").replace("\n", " ")
 
 
+def _posts_payload(body: bytes) -> bool:
+    """True when the body is an RSS feed with items, or Substack's post JSON.
+
+    A Cloudflare "Just a moment..." page is HTML. Challenge endpoints also
+    return small JSON objects. Neither of those is a post list.
+    """
+    cleaned = body.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if _looks_like_feed(cleaned):
+        try:
+            root = ET.fromstring(cleaned)
+        except ET.ParseError:
+            return False
+        return any(element.tag.rsplit("}", 1)[-1] == "item" for element in root.iter())
+    if not _looks_like_json(cleaned):
+        return False
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return False
+    posts = data.get("posts") if isinstance(data, dict) else data
+    if not isinstance(posts, list):
+        return False
+    return any(isinstance(item, dict) and str(item.get("title") or "").strip() for item in posts)
+
+
 def fetch_with_urllib(url: str) -> bytes:
     request = urllib.request.Request(
         url,
@@ -161,37 +192,29 @@ def fetch_with_curl(url: str) -> bytes:
 
 
 def fetch_with_curl_cffi(url: str) -> bytes:
-    """Direct download with a browser TLS fingerprint. Optional dependency."""
+    """Direct download with a browser TLS fingerprint. Optional dependency.
+
+    Leave the impersonated browser's own headers in place so the TLS
+    fingerprint and the header set stay consistent.
+    """
     try:
         from curl_cffi import requests as curl_requests
     except ImportError as exc:
         raise RuntimeError("curl_cffi is not installed") from exc
-    try:
-        response = curl_requests.get(
-            url,
-            impersonate="chrome",
-            timeout=40,
-            headers={
-                "Accept": "application/rss+xml, application/xml, text/xml, application/json;q=0.9, */*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-    except Exception as exc:
-        raise RuntimeError(f"curl_cffi request failed: {exc}") from exc
-    body = response.content or b""
-    if response.status_code != 200 or not _acceptable(body):
-        raise RuntimeError(f"curl_cffi HTTP {response.status_code}: {_snippet(body)}")
-    return body
 
-
-def fetch_bytes(url: str, fetchers: tuple) -> bytes:
+    profiles = ("chrome152", "firefox155")
     errors: list[str] = []
-    for fetcher in fetchers:
+    for profile in profiles:
         try:
-            return fetcher(url)
-        except RuntimeError as exc:
-            errors.append(str(exc)[:180])
-    raise RuntimeError("; ".join(errors))
+            response = curl_requests.get(url, impersonate=profile, timeout=40)
+        except Exception as exc:
+            errors.append(f"{profile}: {exc}")
+            continue
+        body = response.content or b""
+        if response.status_code == 200 and _acceptable(body):
+            return body
+        errors.append(f"{profile} HTTP {response.status_code}: {_snippet(body)}")
+    raise RuntimeError("curl_cffi " + "; ".join(errors))
 
 
 def _local(tag: str) -> str:
@@ -292,17 +315,24 @@ def parse_iso(raw: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _archive_post_list(data: object) -> list:
+    """Accept the current {"posts": [...]} body and the older bare list."""
+    if isinstance(data, dict):
+        data = data.get("posts")
+    if not isinstance(data, list):
+        raise RuntimeError("Substack archive was not a list of posts")
+    return data
+
+
 def parse_archive(payload: bytes) -> Feed:
     """Substack's public archive. Same posts as the RSS feed, as JSON."""
     try:
         data = json.loads(payload)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Substack archive was not valid JSON: {exc}") from exc
-    if not isinstance(data, list):
-        raise RuntimeError("Substack archive was not a list of posts")
 
     posts: list[Post] = []
-    for item in data:
+    for item in _archive_post_list(data):
         if not isinstance(item, dict):
             continue
         item_title = _plain_text(str(item.get("title") or ""))
@@ -343,32 +373,144 @@ def _extract_payload(document: str) -> bytes | None:
     return None
 
 
+def _playwright_installed() -> bool:
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _installed_chrome_version() -> str:
+    binary = (
+        shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+        or shutil.which("chromium")
+        or shutil.which("chromium-browser")
+    )
+    if binary is None:
+        return "156.0.0.0"
+    try:
+        out = subprocess.check_output([binary, "--version"], text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "156.0.0.0"
+    match = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
+    return match.group(1) if match else "156.0.0.0"
+
+
+def _desktop_user_agent(version: str) -> str:
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{version} Safari/537.36"
+    )
+
+
+def _launch_browser(playwright, headed: bool):
+    """Use the machine's Chrome when it is installed, then Playwright's Chromium.
+
+    GitHub-hosted runners ship Google Chrome. That binary can run the
+    JavaScript on Cloudflare's challenge page. A bare HTTP client cannot.
+    Headed mode (used when a display or Xvfb is available) does not advertise
+    itself as HeadlessChrome, which Cloudflare treats as a bot.
+    """
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+    ]
+    errors: list[str] = []
+    attempts: tuple[dict, ...] = ({"channel": "chrome"}, {})
+    for extra in attempts:
+        try:
+            return playwright.chromium.launch(
+                headless=not headed,
+                args=args,
+                ignore_default_args=["--enable-automation"],
+                **extra,
+            )
+        except Exception as exc:
+            label = extra.get("channel", "chromium")
+            errors.append(f"{label}: {exc}")
+    raise RuntimeError("could not launch a browser: " + "; ".join(errors))
+
+
+def _hide_headless_client_hints(page, version: str) -> None:
+    """Replace the HeadlessChrome client hints. Ignore CDP mismatches."""
+    major = version.split(".", 1)[0]
+    user_agent = _desktop_user_agent(version)
+    try:
+        session = page.context.new_cdp_session(page)
+        session.send(
+            "Network.setUserAgentOverride",
+            {
+                "userAgent": user_agent,
+                "acceptLanguage": "en-US,en",
+                "platform": "Linux",
+                "userAgentMetadata": {
+                    "brands": [
+                        {"brand": "Chromium", "version": major},
+                        {"brand": "Google Chrome", "version": major},
+                        {"brand": "Not.A/Brand", "version": "99"},
+                    ],
+                    "fullVersionList": [
+                        {"brand": "Chromium", "version": version},
+                        {"brand": "Google Chrome", "version": version},
+                        {"brand": "Not.A/Brand", "version": "99.0.0.0"},
+                    ],
+                    "fullVersion": version,
+                    "platform": "Linux",
+                    "platformVersion": "6.8.0",
+                    "architecture": "x86",
+                    "model": "",
+                    "mobile": False,
+                    "bitness": "64",
+                    "wow64": False,
+                },
+            },
+        )
+    except Exception as exc:
+        print(f"browser client-hint override skipped: {exc}", flush=True)
+
+
 def fetch_with_playwright(url: str) -> bytes:
-    """Open the Substack URL in Chromium and keep the response after any challenge."""
+    """Open the Substack URL in Chrome and keep the response after any challenge."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError("playwright is not installed") from exc
 
-    found: dict[str, bytes] = {}
-    rejected: list[str] = []
+    headed = bool(os.environ.get("DISPLAY"))
+    print(
+        f"Opening {url} in {'headed' if headed else 'headless'} Chrome. "
+        "Direct download did not return posts.",
+        flush=True,
+    )
+    found: list[bytes] = []
 
     def remember(body: bytes) -> None:
-        if not body or "body" in found:
-            return
-        if _usable(body):
-            found["body"] = body.lstrip(b"\xef\xbb\xbf")
-            return
-        if len(rejected) < 2:
-            rejected.append(repr(body[:80]))
+        if body and _posts_payload(body):
+            found.append(body.lstrip(b"\xef\xbb\xbf"))
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        browser = _launch_browser(playwright, headed=headed)
         try:
-            page = browser.new_page(user_agent=BROWSER_UA, locale="en-US")
+            context_kwargs: dict = {
+                "locale": "en-US",
+                "viewport": {"width": 1366, "height": 768},
+            }
+            # Headless Chrome's default user agent contains "HeadlessChrome".
+            # Cloudflare serves the challenge page and then refuses to clear it.
+            chrome_version = _installed_chrome_version()
+            if not headed:
+                context_kwargs["user_agent"] = _desktop_user_agent(chrome_version)
+            context = browser.new_context(**context_kwargs)
+            # Cloudflare treats navigator.webdriver as a bot signal.
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            page = context.new_page()
+            if not headed:
+                _hide_headless_client_hints(page, chrome_version)
 
             def on_response(response) -> None:
                 try:
@@ -378,16 +520,21 @@ def fetch_with_playwright(url: str) -> bytes:
 
             page.on("response", on_response)
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            for _ in range(12):
-                if "body" in found:
-                    return found["body"]
+            for _ in range(15):
+                if found:
+                    return found[-1]
                 extracted = _extract_payload(page.content())
-                if extracted is not None and _usable(extracted):
+                if extracted is not None and _posts_payload(extracted):
                     return extracted
-                print(f"browser waiting: title={page.title()!r} rejected={rejected}", flush=True)
+                title = ""
+                try:
+                    title = page.title()
+                except Exception:
+                    title = ""
+                print(f"browser waiting: title={title!r}", flush=True)
                 page.wait_for_timeout(2000)
             raise RuntimeError(
-                f"browser did not return posts: title={page.title()!r} rejected={rejected} "
+                f"browser did not return posts: title={page.title()!r} "
                 f"page={_snippet(page.content().encode())}"
             )
         except RuntimeError:
@@ -404,16 +551,19 @@ def load_posts(use_browser: bool = False) -> tuple[Feed, str]:
         ("rss", FEED_URL, parse_feed),
         ("archive", ARCHIVE_URL, parse_archive),
     )
-    if use_browser:
-        # The plain clients already failed in this job. Don't repeat them.
-        rounds: list[tuple] = [(fetch_with_playwright,)]
-    else:
-        rounds = [(fetch_with_urllib, fetch_with_curl), (fetch_with_curl_cffi,)]
+    # Plain clients first. Chrome is only opened when those are challenged,
+    # and only if Playwright is installed (or the caller asked for it).
+    rounds: list[tuple] = [
+        (fetch_with_urllib, fetch_with_curl),
+        (fetch_with_curl_cffi,),
+    ]
+    if use_browser or _playwright_installed():
+        rounds.append((fetch_with_playwright,))
     errors: list[str] = []
     for fetchers in rounds:
         for label, url, parser in sources:
             try:
-                body = fetch_bytes(url, fetchers)
+                body, via = fetch_bytes(url, fetchers)
                 feed = parser(body)
             except RuntimeError as exc:
                 errors.append(f"{label}: {exc}")
@@ -421,9 +571,19 @@ def load_posts(use_browser: bool = False) -> tuple[Feed, str]:
             if not feed.posts:
                 errors.append(f"{label}: no posts")
                 continue
-            print(f"Source: {label} ({url})")
+            print(f"Source: {label} via {via} ({url})")
             return feed, url
     raise RuntimeError("Could not read posts from Substack. " + " | ".join(errors))
+
+
+def fetch_bytes(url: str, fetchers: tuple) -> tuple[bytes, str]:
+    errors: list[str] = []
+    for fetcher in fetchers:
+        try:
+            return fetcher(url), fetcher.__name__
+        except RuntimeError as exc:
+            errors.append(str(exc)[:300])
+    raise RuntimeError("; ".join(errors))
 
 
 def format_date(when: datetime) -> str:
@@ -677,6 +837,28 @@ def build(feed: Feed, generated_at: datetime, site_dir: Path, source_url: str) -
     write_site(page, site_dir)
 
 
+def explain_fallback(site_dir: Path) -> str | None:
+    """Return a one-line warning when a previous build can still be published."""
+    index = site_dir / "index.html"
+    embed = site_dir / "embed.html"
+    if not index.is_file() or not embed.is_file():
+        return None
+    text = index.read_text(encoding="utf-8", errors="replace")
+    if 'class="post"' not in text or "substack.com" not in text:
+        return None
+    return (
+        "Substack could not be reached. Left the saved pages in "
+        f"{site_dir} unchanged. The build will publish that last good copy."
+    )
+
+
+def _github_warning(message: str) -> None:
+    one_line = " ".join(message.split())
+    print(f"warning: {one_line}", flush=True)
+    # Actions turns this into a yellow annotation. The step itself stays green.
+    print(f"::warning::{one_line}", flush=True)
+
+
 def run_self_test() -> None:
     older = "Mon, 01 Jan 2024 00:00:00 GMT"
     newer = "Tue, 27 Oct 2026 12:00:00 GMT"
@@ -756,10 +938,35 @@ def run_self_test() -> None:
         raise AssertionError(f"archive slug fallback failed: {archived.posts[0].url}")
     if archived.posts[0].summary != "new":
         raise AssertionError(f"archive summary failed: {archived.posts[0].summary}")
+    wrapped_archive = json.dumps({"posts": json.loads(archive), "nextCursor": None}).encode()
+    wrapped_posts = parse_archive(wrapped_archive)
+    if [post.title for post in wrapped_posts.posts] != [post.title for post in archived.posts]:
+        raise AssertionError("archive object shape was not accepted")
+    if _posts_payload(b"<html><title>Just a moment...</title></html>"):
+        raise AssertionError("Cloudflare challenge page looked like posts")
+    if not _posts_payload(xml_bytes):
+        raise AssertionError("RSS feed was not recognized as posts")
+    if not _posts_payload(wrapped_archive):
+        raise AssertionError("archive object was not recognized as posts")
     wrapped = "<html><body><pre>&lt;rss&gt;nope</pre><rss version=\"2.0\"><channel><title>T</title></channel></rss></body></html>"
     extracted = _extract_payload(wrapped)
     if extracted is None or b"<rss" not in extracted:
         raise AssertionError("could not extract RSS from a browser document")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        empty = Path(tmp) / "empty"
+        empty.mkdir()
+        if explain_fallback(empty) is not None:
+            raise AssertionError("missing pages should not count as a saved copy")
+        saved = Path(tmp) / "saved"
+        saved.mkdir()
+        page_text = '<ol class="posts"><li class="post"><a href="https://coloforniadreaming.substack.com/p/a">'
+        (saved / "index.html").write_text(page_text, encoding="utf-8")
+        (saved / "embed.html").write_text(page_text, encoding="utf-8")
+        notice = explain_fallback(saved)
+        if notice is None or "Substack could not be reached" not in notice or "\n" in notice:
+            raise AssertionError(f"saved pages should produce a one-line notice: {notice!r}")
     print("self-test ok")
 
 
@@ -769,7 +976,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--browser",
         action="store_true",
-        help="Also open the Substack URL in Chromium if the plain clients are challenged.",
+        help="Open Substack in Chrome if the direct download is challenged. "
+        "This also happens on its own when Playwright is installed.",
     )
     parser.add_argument("--site-dir", type=Path, default=SITE_DIR, help="Directory to write the static site into.")
     args = parser.parse_args(argv)
@@ -778,7 +986,17 @@ def main(argv: list[str]) -> int:
         run_self_test()
         return 0
 
-    feed, source_url = load_posts(use_browser=args.browser)
+    try:
+        feed, source_url = load_posts(use_browser=args.browser)
+    except RuntimeError as exc:
+        notice = explain_fallback(args.site_dir)
+        if notice is None:
+            raise
+        detail = " ".join(str(exc).split())
+        if len(detail) > 400:
+            detail = detail[:400].rstrip() + "…"
+        _github_warning(f"{notice} {detail}")
+        return 0
     build(feed, datetime.now(timezone.utc), args.site_dir, source_url)
     print(f"Wrote {args.site_dir / 'index.html'}")
     print(f"Wrote {args.site_dir / 'embed.html'}")
