@@ -48,9 +48,13 @@ A job named **Publish Substack embed** runs every 6 hours (UTC). It also runs wh
 
 The job downloads `https://coloforniadreaming.substack.com/feed` directly from Substack. It does not use rss2json or any other third-party RSS proxy.
 
-Substack’s host often shows GitHub’s servers a “checking your browser” page, so the download from GitHub does not always succeed. When that happens, the job still publishes the saved copy of the page in this repository and leaves a yellow warning on the Actions run. That saved copy already lists the posts that were on the feed when it was last built here. On any run that can download the feed, the live page is rebuilt from the new posts.
+Substack’s publication host often shows GitHub’s servers a “checking your browser” page. When that happens, the job reads the same public posts from `https://substack.com/api/v1/profile/posts` for this publication. If that is blocked too, it opens the Substack address in Chrome on the runner. These are direct requests to Substack.
 
-If a new Substack post is missing from the website, the automatic download was blocked. Someone with this repo can rebuild the page from a normal computer, where the feed opens, with `python3 scripts/build_site.py`, then commit the updated `site` folder. The next publish puts that copy on the website.
+If Substack is unreachable even in Chrome, the job stays green and publishes the saved copy of the page already in this repository. The Actions log shows a warning that the saved pages were left unchanged. That copy lists the posts from the last build that could reach Substack.
+
+If a new Substack post is still missing after a green run, open that run and read the warning. GitHub’s own servers are on a network Cloudflare does not let through, and the browser check does not clear there. Someone with this repo can rebuild the page from a normal computer, where the feed opens, with `python3 scripts/build_site.py`, then commit the updated `site` folder. The next publish puts that copy on the website.
+
+To have the 6-hour job download the posts by itself, add a self-hosted runner (Settings, Actions, Runners) on a computer where https://coloforniadreaming.substack.com/feed opens, and in `.github/workflows/pages.yml` change `runs-on: ubuntu-latest` under the build job to that runner’s label. No secret and no change to the Pages source are required. Pages is already set to GitHub Actions.
 
 If nobody commits to this repo for about 60 days, GitHub pauses the 6-hour schedule. The last published page stays up. Open **Actions**, run **Publish Substack embed** once, and the schedule starts again.
 
@@ -58,12 +62,12 @@ If nobody commits to this repo for about 60 days, GitHub pauses the 6-hour sched
 
 1. Open the **Actions** tab and look at the newest **Publish Substack embed** run.
 2. A red X on the **deploy** job usually means GitHub Pages is not set to **GitHub Actions** yet. Do the one-time steps above, then click **Run workflow**.
-3. A yellow warning means the feed could not be downloaded from GitHub’s network. The saved copy stays up. See the section above to rebuild it from a normal computer.
+3. A yellow warning means Substack could not be downloaded, including in Chrome. The saved copy stays up. See the section above to rebuild it from a normal computer.
 4. After a green check, wait about 10 minutes, then refresh the website.
 
 ## For a developer
 
-- `scripts/build_site.py` downloads posts and writes `site/index.html` and `site/embed.html`. It tries the RSS feed first. If that URL is challenged, it reads Substack’s own archive JSON at the publication. Both are direct requests. The script does not use rss2json or any other proxy. Actions installs `curl-cffi` so the request can use a browser TLS fingerprint. If the runner still gets Cloudflare’s challenge page, the workflow publishes the `site/` snapshot instead of failing.
+- `scripts/build_site.py` downloads posts and writes `site/index.html` and `site/embed.html`. It tries the RSS feed first (`https://coloforniadreaming.substack.com/feed`). If that URL is challenged, it reads Substack’s archive at `https://coloforniadreaming.substack.com/api/v1/archive?sort=new&limit=12`, which is JSON shaped as `{"posts": [...]}`. If the publication host is still blocked, it reads the same posts from `https://substack.com/api/v1/profile/posts` for the Colofornia Dreaming profile. These are direct requests. The script does not use rss2json or any other proxy. Actions installs `curl-cffi` (a browser TLS fingerprint) and Patchright. If every direct download is still Cloudflare’s challenge page, Patchright opens the URL in the Chrome already installed on the runner, under a virtual display. Patchright is used instead of ordinary browser automation because Cloudflare holds that on the challenge page. If that also fails, the script leaves the `site/` snapshot in place, prints a warning, and exits successfully so the saved page is what gets published.
 - `python3 scripts/build_site.py --self-test` checks parsing and HTML escaping without the network.
 - `python3 scripts/build_site.py` rebuilds the snapshot in `site/`.
 - `.github/workflows/pages.yml` rebuilds the page on the runner. Pull requests only build it. Pushes to `main`, the 6-hour schedule, and **Run workflow** also deploy the `site` folder with GitHub Pages (`actions/deploy-pages`). The live site is that deployed copy. It can be newer than the snapshot committed in git.

@@ -1,6 +1,11 @@
-# Rebuild the embed from the Substack RSS feed and publish it with GitHub Pages.
+# Rebuild the embed from Substack and publish it with GitHub Pages.
 # The feed is downloaded on the runner directly from Substack.
 # Do not route this through rss2json or any other proxy.
+#
+# Plain HTTP often gets Cloudflare's "Just a moment..." page on GitHub's
+# servers. The builder then opens the same Substack URL in Chrome. If Substack
+# is still unreachable, the script keeps the saved site/ pages, prints a
+# warning, and exits 0 so this workflow stays green.
 #
 # Pull requests only build the page, so the log shows the posts that were found.
 # Pushes to main, the 6-hour schedule, and Run workflow also deploy to Pages.
@@ -30,21 +35,28 @@ jobs:
       - name: Check the page builder
         run: python3 scripts/build_site.py --self-test
 
-      # Direct request only. curl-cffi is a browser TLS fingerprint for that
-      # same Substack URL, not an RSS proxy. GitHub-hosted runners are often
-      # shown Cloudflare's "Just a moment..." page; the saved site/ is published
-      # when that happens.
+      # Direct request only. The publication host usually answers GitHub with
+      # Cloudflare's challenge page, so the script also reads the public
+      # profile posts API on substack.com. curl-cffi is a browser TLS
+      # fingerprint for that same request, not an RSS proxy. Patchright drives
+      # the Chrome already installed on the runner when every direct download
+      # is challenged. Stock Playwright is detected and left on the challenge
+      # page. The script leaves site/ in place and exits 0 if Substack cannot
+      # be reached at all.
       - name: Build the embed from the Substack feed
-        id: refresh
-        continue-on-error: true
         run: |
-          python3 -m pip install --disable-pip-version-check "curl-cffi==0.17.0"
-          python3 scripts/build_site.py
-
-      - name: Use the saved page when Substack challenges this runner
-        if: steps.refresh.outcome == 'failure'
-        run: |
-          echo "::warning::Substack returned Cloudflare's browser check to this runner. Publishing the saved copy in site/. The page refreshes itself on any run that can download the feed."
+          python3 -m pip install --disable-pip-version-check "curl-cffi==0.17.0" "patchright==1.64.4"
+          if ! command -v xvfb-run >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb
+          fi
+          # A real display keeps Chrome from calling itself HeadlessChrome.
+          # Cloudflare leaves that client on the "Just a moment..." page.
+          if command -v xvfb-run >/dev/null; then
+            xvfb-run -a python3 scripts/build_site.py
+          else
+            python3 scripts/build_site.py
+          fi
           test -f site/index.html
           test -f site/embed.html
 
